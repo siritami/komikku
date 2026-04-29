@@ -10,7 +10,6 @@ import android.os.Environment
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.net.toUri
-import eu.kanade.domain.base.BasePreferences
 import eu.kanade.tachiyomi.extension.ExtensionManager
 import eu.kanade.tachiyomi.extension.installer.Installer
 import eu.kanade.tachiyomi.extension.model.Extension
@@ -59,7 +58,10 @@ internal class ExtensionInstaller(private val context: Context) {
 
     private val downloadsStateFlows = hashMapOf<Long, MutableStateFlow<InstallStep>>()
 
-    private val extensionInstaller = Injekt.get<BasePreferences>().extensionInstaller()
+    /**
+     * Maps download IDs to their source repo URLs for jar-based installation.
+     */
+    private val downloadRepoUrls = hashMapOf<Long, String>()
 
     /**
      * Adds the given extension to the downloads queue and returns an observable containing its
@@ -91,6 +93,11 @@ internal class ExtensionInstaller(private val context: Context) {
 
         val id = downloadManager.enqueue(request)
         activeDownloads[pkgName] = id
+
+        // Track repo URL for jar-based installation (no system install)
+        if (extension is Extension.Available) {
+            downloadRepoUrls[id] = extension.repoUrl
+        }
 
         val downloadStateFlow = MutableStateFlow(InstallStep.Pending)
         downloadsStateFlows[id] = downloadStateFlow
@@ -150,54 +157,47 @@ internal class ExtensionInstaller(private val context: Context) {
         .distinctUntilChanged()
 
     /**
-     * Starts an intent to install the extension at the given uri.
+     * Installs the extension at the given uri directly as a jar file in the app's
+     * data directory, without triggering system package installation.
      *
      * @param uri The uri of the extension to install.
      */
     fun installApk(downloadId: Long, uri: Uri) {
-        when (val installer = extensionInstaller.get()) {
-            BasePreferences.ExtensionInstaller.LEGACY -> {
-                val intent = Intent(context, ExtensionInstallActivity::class.java)
-                    .setDataAndType(uri, APK_MIME)
-                    .putExtra(EXTRA_DOWNLOAD_ID, downloadId)
-                    .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val repoUrl = downloadRepoUrls.remove(downloadId)
+        val extensionManager = Injekt.get<ExtensionManager>()
+        val tempFile = File(context.cacheDir, "temp_$downloadId")
 
-                context.startActivity(intent)
-            }
-            BasePreferences.ExtensionInstaller.PRIVATE -> {
-                val extensionManager = Injekt.get<ExtensionManager>()
-                val tempFile = File(context.cacheDir, "temp_$downloadId")
-
-                if (tempFile.exists() && !tempFile.delete()) {
-                    // Unlikely but just in case
-                    extensionManager.updateInstallStep(downloadId, InstallStep.Error)
-                    return
-                }
-
-                try {
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        tempFile.outputStream().use { output ->
-                            input.copyTo(output)
-                        }
-                    }
-
-                    if (ExtensionLoader.installPrivateExtensionFile(context, tempFile)) {
-                        extensionManager.updateInstallStep(downloadId, InstallStep.Installed)
-                    } else {
-                        extensionManager.updateInstallStep(downloadId, InstallStep.Error)
-                    }
-                } catch (e: Exception) {
-                    logcat(LogPriority.ERROR, e) { "Failed to read downloaded extension file." }
-                    extensionManager.updateInstallStep(downloadId, InstallStep.Error)
-                }
-
-                tempFile.delete()
-            }
-            else -> {
-                val intent = ExtensionInstallService.getIntent(context, downloadId, uri, installer)
-                ContextCompat.startForegroundService(context, intent)
-            }
+        if (tempFile.exists() && !tempFile.delete()) {
+            extensionManager.updateInstallStep(downloadId, InstallStep.Error)
+            return
         }
+
+        try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                tempFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+
+            val success = if (repoUrl != null) {
+                // Repo-sourced extension: install as jar (organized by repo)
+                ExtensionLoader.installJarExtension(context, tempFile, repoUrl)
+            } else {
+                // Fallback for non-repo downloads: use private extension install
+                ExtensionLoader.installPrivateExtensionFile(context, tempFile)
+            }
+
+            if (success) {
+                extensionManager.updateInstallStep(downloadId, InstallStep.Installed)
+            } else {
+                extensionManager.updateInstallStep(downloadId, InstallStep.Error)
+            }
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to read downloaded extension file." }
+            extensionManager.updateInstallStep(downloadId, InstallStep.Error)
+        }
+
+        tempFile.delete()
     }
 
     /**
@@ -206,6 +206,7 @@ internal class ExtensionInstaller(private val context: Context) {
     fun cancelInstall(pkgName: String) {
         val downloadId = activeDownloads.remove(pkgName) ?: return
         downloadManager.remove(downloadId)
+        downloadRepoUrls.remove(downloadId)
         Installer.cancelInstallQueue(context, downloadId)
     }
 
@@ -221,6 +222,7 @@ internal class ExtensionInstaller(private val context: Context) {
                 .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             context.startActivity(intent)
         } else {
+            ExtensionLoader.uninstallJarExtension(context, pkgName)
             ExtensionLoader.uninstallPrivateExtension(context, pkgName)
             ExtensionInstallReceiver.notifyRemoved(context, pkgName)
         }
@@ -246,6 +248,7 @@ internal class ExtensionInstaller(private val context: Context) {
         if (downloadId != null) {
             downloadManager.remove(downloadId)
             downloadsStateFlows.remove(downloadId)
+            downloadRepoUrls.remove(downloadId)
         }
         if (activeDownloads.isEmpty()) {
             downloadReceiver.unregister()
