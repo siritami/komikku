@@ -433,8 +433,7 @@ class ExtensionManager(
         }
 
         override fun onPackageUninstalled(pkgName: String) {
-            ExtensionLoader.uninstallJarExtension(context, pkgName)
-            ExtensionLoader.uninstallPrivateExtension(context, pkgName)
+            ExtensionLoader.uninstallExtension(pkgName)
             unregisterExtension(pkgName)
             updatePendingUpdatesCount()
         }

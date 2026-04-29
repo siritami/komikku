@@ -58,6 +58,7 @@ class StorageManager(
                     parent.createDirectory(LIBRARY_PATH)?.createDirectory(THUMBNAIL_PATH)?.also {
                         DiskUtil.createNoMediaFile(it, context)
                     }
+                    parent.createDirectory(EXTENSION_PATH)
                 }
                 _changes.send(Unit)
             }
@@ -89,6 +90,10 @@ class StorageManager(
         return baseDir
             ?.createDirectory(LIBRARY_PATH)
             ?.createDirectory(THUMBNAIL_PATH)
+    }
+
+    fun getExtensionDirectory(): UniFile? {
+        return baseDir?.createDirectory(EXTENSION_PATH)
     }
 
     // SY -->
@@ -234,6 +239,7 @@ private const val LOCAL_SOURCE_PATH = "local"
 
 private const val LIBRARY_PATH = "library"
 private const val THUMBNAIL_PATH = "thumbnail"
+private const val EXTENSION_PATH = "extension"
 
 // SY -->
 private const val LOGS_PATH = "logs"

@@ -14,7 +14,6 @@ import eu.kanade.tachiyomi.source.CatalogueSource
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.SourceFactory
 import eu.kanade.tachiyomi.util.lang.Hash
-import eu.kanade.tachiyomi.util.storage.copyAndSetReadOnlyTo
 import eu.kanade.tachiyomi.util.system.ChildFirstPathClassLoader
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -22,7 +21,9 @@ import kotlinx.coroutines.runBlocking
 import logcat.LogPriority
 import mihon.domain.extensionrepo.interactor.GetExtensionRepo
 import mihon.domain.extensionrepo.model.ExtensionRepo
+import com.hippo.unifile.UniFile
 import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.storage.service.StorageManager
 import uy.kohesive.injekt.injectLazy
 import java.io.File
 
@@ -32,9 +33,8 @@ import java.io.File
  * 1. Shared extension: This extension is installed to the system with package
  * installer, so other variants of Tachiyomi and its forks can also use this extension.
  *
- * 2. Private extension: This extension is put inside private data directory of the
- * running app, so this extension can only be used by the running app and not shared
- * with other apps.
+ * 2. User storage extension: This extension APK is stored in user-picked storage
+ * under the extension/ directory via SAF, organized by repo hash subdirectories.
  *
  * When both kinds of extensions are installed with a same package name, shared
  * extension will be used unless the version codes are different. In that case the
@@ -47,6 +47,7 @@ internal object ExtensionLoader {
 
     // KMK -->
     private val getExtensionRepo: GetExtensionRepo by injectLazy()
+    private val storageManager: StorageManager by injectLazy()
     // KMK <--
 
     private val loadNsfwSource by lazy {
@@ -66,32 +67,36 @@ internal object ExtensionLoader {
         PackageManager.GET_SIGNATURES or
         (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) PackageManager.GET_SIGNING_CERTIFICATES else 0)
 
-    private const val PRIVATE_EXTENSION_EXTENSION = "ext"
+    private const val APK_EXTENSION = "apk"
 
-    private const val JAR_EXTENSION_EXTENSION = "jar"
-    private const val JAR_EXTENSIONS_DIR = "extensions_jar"
+    private fun getExtensionBaseDir(): UniFile? {
+        return try {
+            storageManager.getExtensionDirectory()
+        } catch (e: Exception) {
+            null
+        }
+    }
 
-    private fun getPrivateExtensionDir(context: Context) = File(context.filesDir, "exts")
-
-    private fun getJarExtensionBaseDir(context: Context) = File(context.filesDir, JAR_EXTENSIONS_DIR)
-
-    private fun getJarRepoDir(context: Context, repoBaseUrl: String): File {
+    private fun getExtensionRepoDir(repoBaseUrl: String): UniFile? {
         val hash = Hash.sha256(repoBaseUrl.toByteArray()).take(16)
-        return File(getJarExtensionBaseDir(context), hash)
+        return getExtensionBaseDir()?.createDirectory(hash)
     }
 
-    private fun findJarExtensionFile(context: Context, pkgName: String): File? {
-        val baseDir = getJarExtensionBaseDir(context)
-        if (!baseDir.isDirectory) return null
-        return baseDir.listFiles()?.asSequence()
-            ?.filter { it.isDirectory }
-            ?.mapNotNull { repoDir ->
-                File(repoDir, "$pkgName.$JAR_EXTENSION_EXTENSION").takeIf { it.isFile }
+    private fun findExtensionFile(pkgName: String): UniFile? {
+        val baseDir = getExtensionBaseDir() ?: return null
+        val fileName = "$pkgName.$APK_EXTENSION"
+        // Check root (private extensions)
+        baseDir.findFile(fileName)?.takeIf { it.isFile }?.let { return it }
+        // Check repo subdirectories
+        baseDir.listFiles()?.forEach { subDir ->
+            if (subDir.isDirectory) {
+                subDir.findFile(fileName)?.takeIf { it.isFile }?.let { return it }
             }
-            ?.firstOrNull()
+        }
+        return null
     }
 
-    fun installPrivateExtensionFile(context: Context, file: File): Boolean {
+    fun installPrivateExtension(context: Context, file: File): Boolean {
         val extension = context.packageManager.getPackageArchiveInfo(file.absolutePath, PACKAGE_FLAGS)
             ?.takeIf { isPackageAnExtension(it) } ?: return false
         val currentExtension = getExtensionPackageInfoFromPkgName(context, extension.packageName)
@@ -116,10 +121,16 @@ internal object ExtensionLoader {
             }
         }
 
-        val target = File(getPrivateExtensionDir(context), "${extension.packageName}.$PRIVATE_EXTENSION_EXTENSION")
+        val baseDir = getExtensionBaseDir() ?: return false
+        val fileName = "${extension.packageName}.$APK_EXTENSION"
+        baseDir.findFile(fileName)?.delete()
+        val target = baseDir.createFile(fileName) ?: return false
         return try {
-            target.delete()
-            file.copyAndSetReadOnlyTo(target, overwrite = true)
+            target.openOutputStream().use { output ->
+                file.inputStream().use { input ->
+                    input.copyTo(output)
+                }
+            }
             if (currentExtension != null) {
                 ExtensionInstallReceiver.notifyReplaced(context, extension.packageName)
             } else {
@@ -133,11 +144,7 @@ internal object ExtensionLoader {
         }
     }
 
-    fun uninstallPrivateExtension(context: Context, pkgName: String) {
-        File(getPrivateExtensionDir(context), "$pkgName.$PRIVATE_EXTENSION_EXTENSION").delete()
-    }
-
-    fun installJarExtension(context: Context, file: File, repoBaseUrl: String): Boolean {
+    fun installRepoExtension(context: Context, file: File, repoBaseUrl: String): Boolean {
         val extension = context.packageManager.getPackageArchiveInfo(file.absolutePath, PACKAGE_FLAGS)
             ?.takeIf { isPackageAnExtension(it) } ?: return false
         val currentExtension = getExtensionPackageInfoFromPkgName(context, extension.packageName)
@@ -162,13 +169,16 @@ internal object ExtensionLoader {
             }
         }
 
-        val repoDir = getJarRepoDir(context, repoBaseUrl)
-        repoDir.mkdirs()
-
-        val target = File(repoDir, "${extension.packageName}.$JAR_EXTENSION_EXTENSION")
+        val repoDir = getExtensionRepoDir(repoBaseUrl) ?: return false
+        val fileName = "${extension.packageName}.$APK_EXTENSION"
+        repoDir.findFile(fileName)?.delete()
+        val target = repoDir.createFile(fileName) ?: return false
         return try {
-            target.delete()
-            file.copyAndSetReadOnlyTo(target, overwrite = true)
+            target.openOutputStream().use { output ->
+                file.inputStream().use { input ->
+                    input.copyTo(output)
+                }
+            }
             if (currentExtension != null) {
                 ExtensionInstallReceiver.notifyReplaced(context, extension.packageName)
             } else {
@@ -176,14 +186,14 @@ internal object ExtensionLoader {
             }
             true
         } catch (e: Exception) {
-            logcat(LogPriority.ERROR, e) { "Failed to copy jar extension file." }
+            logcat(LogPriority.ERROR, e) { "Failed to copy extension file." }
             target.delete()
             false
         }
     }
 
-    fun uninstallJarExtension(context: Context, pkgName: String) {
-        findJarExtensionFile(context, pkgName)?.delete()
+    fun uninstallExtension(pkgName: String) {
+        findExtensionFile(pkgName)?.delete()
     }
 
     /**
@@ -205,58 +215,14 @@ internal object ExtensionLoader {
             .filter { isPackageAnExtension(it) }
             .map { ExtensionInfo(packageInfo = it, isShared = true) }
 
-        val privateExtPkgs = getPrivateExtensionDir(context)
-            .listFiles()
-            ?.asSequence()
-            ?.filter { it.isFile && it.extension == PRIVATE_EXTENSION_EXTENSION }
-            ?.mapNotNull {
-                // Just in case, since Android 14+ requires them to be read-only
-                if (it.canWrite()) {
-                    it.setReadOnly()
-                }
+        val userStorageExtPkgs = loadUserStorageExtensions(pkgManager)
 
-                val path = it.absolutePath
-                pkgManager.getPackageArchiveInfo(path, PACKAGE_FLAGS)
-                    ?.apply { applicationInfo!!.fixBasePaths(path) }
-            }
-            ?.filter { isPackageAnExtension(it) }
-            ?.map { ExtensionInfo(packageInfo = it, isShared = false) }
-            ?: emptySequence()
-
-        val jarExtPkgs = getJarExtensionBaseDir(context)
-            .let { baseDir ->
-                if (baseDir.isDirectory) {
-                    baseDir.listFiles()?.asSequence()
-                        ?.filter { it.isDirectory }
-                        ?.flatMap { repoDir ->
-                            repoDir.listFiles()?.asSequence()
-                                ?.filter { it.isFile && it.extension == JAR_EXTENSION_EXTENSION }
-                                ?: emptySequence()
-                        }
-                        ?.mapNotNull { jarFile ->
-                            if (jarFile.canWrite()) {
-                                jarFile.setReadOnly()
-                            }
-                            val path = jarFile.absolutePath
-                            pkgManager.getPackageArchiveInfo(path, PACKAGE_FLAGS)
-                                ?.apply { applicationInfo!!.fixBasePaths(path) }
-                        }
-                        ?.filter { isPackageAnExtension(it) }
-                        ?.map { ExtensionInfo(packageInfo = it, isShared = false) }
-                        ?: emptySequence()
-                } else {
-                    emptySequence()
-                }
-            }
-
-        val allLocalExtPkgs = (privateExtPkgs + jarExtPkgs).toList()
-
-        val extPkgs = (sharedExtPkgs + allLocalExtPkgs.asSequence())
-            // Remove duplicates. Shared takes priority than private/jar by default
+        val extPkgs = (sharedExtPkgs + userStorageExtPkgs.asSequence())
+            // Remove duplicates. Shared takes priority over user storage by default
             .distinctBy { it.packageInfo.packageName }
             // Compare version number
             .mapNotNull { pkg ->
-                val localPkg = allLocalExtPkgs
+                val localPkg = userStorageExtPkgs
                     .firstOrNull { it.packageInfo.packageName == pkg.packageInfo.packageName }
                 selectExtensionPackage(pkg, localPkg)
             }
@@ -285,6 +251,42 @@ internal object ExtensionLoader {
     }
 
     /**
+     * Scans user storage for extension APK files.
+     * Root-level files are private extensions, subdirectory files are repo extensions.
+     */
+    private fun loadUserStorageExtensions(pkgManager: PackageManager): List<ExtensionInfo> {
+        val baseDir = getExtensionBaseDir() ?: return emptyList()
+        val result = mutableListOf<ExtensionInfo>()
+
+        baseDir.listFiles()?.forEach { entry ->
+            if (entry.isFile && entry.name?.endsWith(".$APK_EXTENSION") == true) {
+                loadExtensionInfoFromUniFile(entry, pkgManager)?.let { result.add(it) }
+            } else if (entry.isDirectory) {
+                entry.listFiles()?.forEach { extFile ->
+                    if (extFile.isFile && extFile.name?.endsWith(".$APK_EXTENSION") == true) {
+                        loadExtensionInfoFromUniFile(extFile, pkgManager)?.let { result.add(it) }
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    private fun loadExtensionInfoFromUniFile(uniFile: UniFile, pkgManager: PackageManager): ExtensionInfo? {
+        val path = uniFile.filePath ?: return null
+        // Android 14+ requires loaded DEX files to be read-only
+        val file = File(path)
+        if (file.canWrite()) {
+            file.setReadOnly()
+        }
+        return pkgManager.getPackageArchiveInfo(path, PACKAGE_FLAGS)
+            ?.apply { applicationInfo!!.fixBasePaths(path) }
+            ?.takeIf { isPackageAnExtension(it) }
+            ?.let { ExtensionInfo(packageInfo = it, isShared = false) }
+    }
+
+    /**
      * Attempts to load an extension from the given package name. It checks if the extension
      * contains the required feature flag before trying to load it.
      */
@@ -302,34 +304,18 @@ internal object ExtensionLoader {
     }
 
     private fun getExtensionInfoFromPkgName(context: Context, pkgName: String): ExtensionInfo? {
-        val privateExtensionFile = File(getPrivateExtensionDir(context), "$pkgName.$PRIVATE_EXTENSION_EXTENSION")
-        val privatePkg = if (privateExtensionFile.isFile) {
-            context.packageManager.getPackageArchiveInfo(privateExtensionFile.absolutePath, PACKAGE_FLAGS)
+        val extensionFile = findExtensionFile(pkgName)
+        val localPkg = extensionFile?.let { uniFile ->
+            val path = uniFile.filePath ?: return@let null
+            context.packageManager.getPackageArchiveInfo(path, PACKAGE_FLAGS)
                 ?.takeIf { isPackageAnExtension(it) }
                 ?.let {
-                    it.applicationInfo!!.fixBasePaths(privateExtensionFile.absolutePath)
+                    it.applicationInfo!!.fixBasePaths(path)
                     ExtensionInfo(
                         packageInfo = it,
                         isShared = false,
                     )
                 }
-        } else {
-            null
-        }
-
-        val jarExtensionFile = findJarExtensionFile(context, pkgName)
-        val jarPkg = if (jarExtensionFile != null) {
-            context.packageManager.getPackageArchiveInfo(jarExtensionFile.absolutePath, PACKAGE_FLAGS)
-                ?.takeIf { isPackageAnExtension(it) }
-                ?.let {
-                    it.applicationInfo!!.fixBasePaths(jarExtensionFile.absolutePath)
-                    ExtensionInfo(
-                        packageInfo = it,
-                        isShared = false,
-                    )
-                }
-        } else {
-            null
         }
 
         val sharedPkg = try {
@@ -345,8 +331,7 @@ internal object ExtensionLoader {
             null
         }
 
-        val bestLocal = selectExtensionPackage(jarPkg, privatePkg)
-        return selectExtensionPackage(sharedPkg, bestLocal)
+        return selectExtensionPackage(sharedPkg, localPkg)
     }
 
     /**
