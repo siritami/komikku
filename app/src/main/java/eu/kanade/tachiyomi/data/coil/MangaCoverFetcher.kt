@@ -61,12 +61,12 @@ class MangaCoverFetcher(
     // KMK <--
     private val isLibraryManga: Boolean,
     private val options: Options,
-    private val coverFileLazy: Lazy<File?>,
     private val customCoverFileLazy: Lazy<File>,
     private val diskCacheKeyLazy: Lazy<String>,
     private val sourceLazy: Lazy<HttpSource?>,
     private val callFactoryLazy: Lazy<Call.Factory>,
     private val imageLoader: ImageLoader,
+    private val coverCache: CoverCache,
 ) : Fetcher {
 
     // KMK -->
@@ -134,23 +134,24 @@ class MangaCoverFetcher(
 
     private suspend fun httpLoader(): FetchResult {
         // Only cache separately if it's a library item
-        val libraryCoverCacheFile = if (isLibraryManga) {
-            coverFileLazy.value ?: error("No cover specified")
-        } else {
-            null
+        // Use user storage (UniFile/SAF) for library covers
+        val libraryCoverUniFile = if (isLibraryManga) coverCache.findCoverUniFile(url) else null
+
+        // Check cached in user storage (SAF)
+        if (libraryCoverUniFile != null && options.diskCachePolicy.readEnabled) {
+            return uniFileLoader(libraryCoverUniFile)
         }
-        if (libraryCoverCacheFile?.exists() == true && options.diskCachePolicy.readEnabled) {
-            return fileLoader(libraryCoverCacheFile)
-        }
+
+        // Determine write target for library covers
+        val writeUniFile = if (isLibraryManga) coverCache.getOrCreateCoverUniFile(url) else null
 
         var snapshot = readFromDiskCache()
         try {
             // Fetch from disk cache
             if (snapshot != null) {
-                val snapshotCoverCache = moveSnapshotToCoverCache(snapshot, libraryCoverCacheFile)
-                if (snapshotCoverCache != null) {
-                    // Read from cover cache after added to library
-                    return fileLoader(snapshotCoverCache)
+                if (writeUniFile != null) {
+                    val result = moveSnapshotToCoverCacheUniFile(snapshot, writeUniFile)
+                    if (result != null) return result
                 }
 
                 // Read from snapshot
@@ -168,10 +169,10 @@ class MangaCoverFetcher(
             val response = executeNetworkRequest()
             val responseBody = checkNotNull(response.body) { "Null response source" }
             try {
-                // Read from cover cache after library manga cover updated
-                val responseCoverCache = writeResponseToCoverCache(response, libraryCoverCacheFile)
-                if (responseCoverCache != null) {
-                    return fileLoader(responseCoverCache)
+                // Write to cover cache in user storage
+                if (writeUniFile != null) {
+                    val result = writeResponseToCoverCacheUniFile(response, writeUniFile)
+                    if (result != null) return result
                 }
 
                 // Read from disk cache
@@ -246,44 +247,53 @@ class MangaCoverFetcher(
         return request.build()
     }
 
-    private fun moveSnapshotToCoverCache(snapshot: DiskCache.Snapshot, cacheFile: File?): File? {
-        if (cacheFile == null) return null
+    private fun uniFileLoader(uniFile: UniFile): FetchResult {
+        // KMK -->
+        setRatioAndColorsInScope(mangaCover)
+        // KMK <--
+        val source = uniFile.openInputStream().source().buffer()
+        return SourceFetchResult(
+            source = ImageSource(source = source, fileSystem = FileSystem.SYSTEM),
+            mimeType = "image/*",
+            dataSource = DataSource.DISK,
+        )
+    }
+
+    private fun moveSnapshotToCoverCacheUniFile(snapshot: DiskCache.Snapshot, uniFile: UniFile): FetchResult? {
         return try {
             imageLoader.diskCache?.run {
                 fileSystem.source(snapshot.data).use { input ->
-                    writeSourceToCoverCache(input, cacheFile)
+                    writeSourceToCoverCacheUniFile(input, uniFile)
                 }
                 remove(diskCacheKey)
             }
-            cacheFile.takeIf { it.exists() }
+            if (uniFile.exists() && uniFile.length() > 0) uniFileLoader(uniFile) else null
         } catch (e: Exception) {
-            logcat(LogPriority.ERROR, e) { "Failed to write snapshot data to cover cache ${cacheFile.name}" }
+            logcat(LogPriority.ERROR, e) { "Failed to write snapshot data to UniFile cover cache ${uniFile.name}" }
             null
         }
     }
 
-    private fun writeResponseToCoverCache(response: Response, cacheFile: File?): File? {
-        if (cacheFile == null || !options.diskCachePolicy.writeEnabled) return null
+    private fun writeResponseToCoverCacheUniFile(response: Response, uniFile: UniFile): FetchResult? {
+        if (!options.diskCachePolicy.writeEnabled) return null
         return try {
             response.peekBody(Long.MAX_VALUE).source().use { input ->
-                writeSourceToCoverCache(input, cacheFile)
+                writeSourceToCoverCacheUniFile(input, uniFile)
             }
-            cacheFile.takeIf { it.exists() }
+            if (uniFile.exists() && uniFile.length() > 0) uniFileLoader(uniFile) else null
         } catch (e: Exception) {
-            logcat(LogPriority.ERROR, e) { "Failed to write response data to cover cache ${cacheFile.name}" }
+            logcat(LogPriority.ERROR, e) { "Failed to write response data to UniFile cover cache ${uniFile.name}" }
             null
         }
     }
 
-    private fun writeSourceToCoverCache(input: Source, cacheFile: File) {
-        cacheFile.parentFile?.mkdirs()
-        cacheFile.delete()
+    private fun writeSourceToCoverCacheUniFile(input: Source, uniFile: UniFile) {
         try {
-            cacheFile.sink().buffer().use { output ->
+            uniFile.openOutputStream().sink().buffer().use { output ->
                 output.writeAll(input)
             }
         } catch (e: Exception) {
-            cacheFile.delete()
+            uniFile.delete()
             throw e
         }
     }
@@ -378,12 +388,12 @@ class MangaCoverFetcher(
                 // KMK <--
                 isLibraryManga = data.favorite,
                 options = options,
-                coverFileLazy = lazy { coverCache.getCoverFile(data.thumbnailUrl) },
                 customCoverFileLazy = lazy { coverCache.getCustomCoverFile(data.id) },
                 diskCacheKeyLazy = lazy { imageLoader.components.key(data, options)!! },
                 sourceLazy = lazy { sourceManager.get(data.source) as? HttpSource },
                 callFactoryLazy = callFactoryLazy,
                 imageLoader = imageLoader,
+                coverCache = coverCache,
             )
         }
     }
@@ -403,12 +413,12 @@ class MangaCoverFetcher(
                 // KMK <--
                 isLibraryManga = data.isMangaFavorite,
                 options = options,
-                coverFileLazy = lazy { coverCache.getCoverFile(data.url) },
                 customCoverFileLazy = lazy { coverCache.getCustomCoverFile(data.mangaId) },
                 diskCacheKeyLazy = lazy { imageLoader.components.key(data, options)!! },
                 sourceLazy = lazy { sourceManager.get(data.sourceId) as? HttpSource },
                 callFactoryLazy = callFactoryLazy,
                 imageLoader = imageLoader,
+                coverCache = coverCache,
             )
         }
     }

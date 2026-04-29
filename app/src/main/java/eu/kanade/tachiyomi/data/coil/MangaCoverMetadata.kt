@@ -120,7 +120,6 @@ object MangaCoverMetadata {
 
         val file = ogFile
             ?: coverCache.getCustomCoverFile(mangaCover.mangaId).takeIf { it.exists() }
-            ?: coverCache.getCoverFile(mangaCover.url)
 
         val bitmap = when {
             bufferedSource != null -> BitmapFactory.decodeStream(bufferedSource.inputStream(), null, options)

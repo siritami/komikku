@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.data.cache
 
 import android.content.Context
+import com.hippo.unifile.UniFile
 import eu.kanade.tachiyomi.util.storage.DiskUtil
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.storage.service.StorageManager
@@ -15,7 +16,7 @@ import java.io.InputStream
  * Names of files are created with the md5 of the thumbnail URL.
  *
  * Library thumbnails are stored in the user-picked storage location
- * under library/thumbnail. Falls back to app data if unavailable.
+ * under library/thumbnail via SAF (UniFile).
  *
  * @param context the application context.
  * @constructor creates an instance of the cover cache.
@@ -25,45 +26,49 @@ class CoverCache(private val context: Context) {
     private val storageManager: StorageManager by injectLazy()
 
     companion object {
-        private const val COVERS_DIR = "covers"
         private const val CUSTOM_COVERS_DIR = "covers/custom"
     }
 
     /**
-     * Fallback cover directory in app data.
+     * Library thumbnail directory in user-picked storage via SAF.
      */
-    private val fallbackCoverDir = getAppDataDir(COVERS_DIR)
-
-    /**
-     * Cover directory in user-picked storage (library/thumbnail),
-     * falling back to app data if not available.
-     */
-    private val cacheDir: File by lazy {
+    private val libraryThumbnailDir: UniFile? by lazy {
         try {
-            storageManager.getLibraryThumbnailDirectory()?.filePath?.let { path ->
-                File(path).also { if (!it.exists()) it.mkdirs() }
-            } ?: fallbackCoverDir
+            storageManager.getLibraryThumbnailDirectory()
         } catch (e: Exception) {
-            fallbackCoverDir
+            null
         }
     }
 
     private val customCoverCacheDir = getAppDataDir(CUSTOM_COVERS_DIR)
 
     /**
-     * Returns the cover from cache.
+     * Finds existing cached cover in user storage via SAF.
+     * Returns null if not found, empty, or user storage is unavailable.
      *
      * @param mangaThumbnailUrl thumbnail url for the manga.
-     * @return cover image.
+     * @return UniFile of the cached cover, or null.
      */
-    fun getCoverFile(mangaThumbnailUrl: String?): File? {
-        return mangaThumbnailUrl?.let {
-            val hash = DiskUtil.hashKeyForDisk(it)
-            val userFile = File(cacheDir, hash)
-            if (userFile.exists()) return userFile
-            val fallbackFile = File(fallbackCoverDir, hash)
-            if (fallbackFile.exists()) return fallbackFile
-            userFile
+    fun findCoverUniFile(mangaThumbnailUrl: String?): UniFile? {
+        return mangaThumbnailUrl?.let { url ->
+            val hash = DiskUtil.hashKeyForDisk(url)
+            libraryThumbnailDir?.findFile(hash)?.takeIf { it.exists() && it.length() > 0 }
+        }
+    }
+
+    /**
+     * Gets or creates a UniFile for writing cover data to user storage via SAF.
+     * Returns null if user storage is unavailable.
+     *
+     * @param mangaThumbnailUrl thumbnail url for the manga.
+     * @return UniFile for writing, or null.
+     */
+    fun getOrCreateCoverUniFile(mangaThumbnailUrl: String?): UniFile? {
+        return mangaThumbnailUrl?.let { url ->
+            val hash = DiskUtil.hashKeyForDisk(url)
+            libraryThumbnailDir?.let { dir ->
+                dir.findFile(hash) ?: dir.createFile(hash)
+            }
         }
     }
 
@@ -103,8 +108,10 @@ class CoverCache(private val context: Context) {
 
         manga.thumbnailUrl?.let { url ->
             val hash = DiskUtil.hashKeyForDisk(url)
-            File(cacheDir, hash).let { if (it.exists() && it.delete()) ++deleted }
-            File(fallbackCoverDir, hash).let { if (it.exists() && it.delete()) ++deleted }
+            // Delete from user storage (SAF)
+            libraryThumbnailDir?.findFile(hash)?.let {
+                if (it.exists() && it.delete()) ++deleted
+            }
         }
 
         if (deleteCustomCover) {
