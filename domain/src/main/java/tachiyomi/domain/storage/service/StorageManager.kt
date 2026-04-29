@@ -55,6 +55,9 @@ class StorageManager(
                     parent.createDirectory(DOWNLOADS_PATH).also {
                         DiskUtil.createNoMediaFile(it, context)
                     }
+                    parent.createDirectory(LIBRARY_PATH)?.createDirectory(THUMBNAIL_PATH)?.also {
+                        DiskUtil.createNoMediaFile(it, context)
+                    }
                 }
                 _changes.send(Unit)
             }
@@ -80,6 +83,12 @@ class StorageManager(
 
     fun getLocalSourceDirectory(): UniFile? {
         return baseDir?.createDirectory(LOCAL_SOURCE_PATH)
+    }
+
+    fun getLibraryThumbnailDirectory(): UniFile? {
+        return baseDir
+            ?.createDirectory(LIBRARY_PATH)
+            ?.createDirectory(THUMBNAIL_PATH)
     }
 
     // SY -->
@@ -222,6 +231,9 @@ class StorageManager(
 private const val AUTOMATIC_BACKUPS_PATH = "autobackup"
 private const val DOWNLOADS_PATH = "downloads"
 private const val LOCAL_SOURCE_PATH = "local"
+
+private const val LIBRARY_PATH = "library"
+private const val THUMBNAIL_PATH = "thumbnail"
 
 // SY -->
 private const val LOGS_PATH = "logs"

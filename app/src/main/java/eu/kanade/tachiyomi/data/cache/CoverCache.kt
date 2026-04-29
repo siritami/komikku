@@ -3,6 +3,8 @@ package eu.kanade.tachiyomi.data.cache
 import android.content.Context
 import eu.kanade.tachiyomi.util.storage.DiskUtil
 import tachiyomi.domain.manga.model.Manga
+import tachiyomi.domain.storage.service.StorageManager
+import uy.kohesive.injekt.injectLazy
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -12,10 +14,15 @@ import java.io.InputStream
  * It is used to store the covers of the library.
  * Names of files are created with the md5 of the thumbnail URL.
  *
+ * Library thumbnails are stored in the user-picked storage location
+ * under library/thumbnail. Falls back to app data if unavailable.
+ *
  * @param context the application context.
  * @constructor creates an instance of the cover cache.
  */
 class CoverCache(private val context: Context) {
+
+    private val storageManager: StorageManager by injectLazy()
 
     companion object {
         private const val COVERS_DIR = "covers"
@@ -23,11 +30,25 @@ class CoverCache(private val context: Context) {
     }
 
     /**
-     * Cache directory used for cache management.
+     * Fallback cover directory in app data.
      */
-    private val cacheDir = getCacheDir(COVERS_DIR)
+    private val fallbackCoverDir = getAppDataDir(COVERS_DIR)
 
-    private val customCoverCacheDir = getCacheDir(CUSTOM_COVERS_DIR)
+    /**
+     * Cover directory in user-picked storage (library/thumbnail),
+     * falling back to app data if not available.
+     */
+    private val cacheDir: File by lazy {
+        try {
+            storageManager.getLibraryThumbnailDirectory()?.filePath?.let { path ->
+                File(path).also { if (!it.exists()) it.mkdirs() }
+            } ?: fallbackCoverDir
+        } catch (e: Exception) {
+            fallbackCoverDir
+        }
+    }
+
+    private val customCoverCacheDir = getAppDataDir(CUSTOM_COVERS_DIR)
 
     /**
      * Returns the cover from cache.
@@ -37,7 +58,12 @@ class CoverCache(private val context: Context) {
      */
     fun getCoverFile(mangaThumbnailUrl: String?): File? {
         return mangaThumbnailUrl?.let {
-            File(cacheDir, DiskUtil.hashKeyForDisk(it))
+            val hash = DiskUtil.hashKeyForDisk(it)
+            val userFile = File(cacheDir, hash)
+            if (userFile.exists()) return userFile
+            val fallbackFile = File(fallbackCoverDir, hash)
+            if (fallbackFile.exists()) return fallbackFile
+            userFile
         }
     }
 
@@ -75,8 +101,10 @@ class CoverCache(private val context: Context) {
     fun deleteFromCache(manga: Manga, deleteCustomCover: Boolean = false): Int {
         var deleted = 0
 
-        getCoverFile(manga.thumbnailUrl)?.let {
-            if (it.exists() && it.delete()) ++deleted
+        manga.thumbnailUrl?.let { url ->
+            val hash = DiskUtil.hashKeyForDisk(url)
+            File(cacheDir, hash).let { if (it.exists() && it.delete()) ++deleted }
+            File(fallbackCoverDir, hash).let { if (it.exists() && it.delete()) ++deleted }
         }
 
         if (deleteCustomCover) {
@@ -98,7 +126,7 @@ class CoverCache(private val context: Context) {
         }
     }
 
-    private fun getCacheDir(dir: String): File {
+    private fun getAppDataDir(dir: String): File {
         return context.getExternalFilesDir(dir)
             ?: File(context.filesDir, dir).also { it.mkdirs() }
     }
