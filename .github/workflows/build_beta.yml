@@ -1,0 +1,66 @@
+name: Beta Builder
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-beta:
+    name: Build beta app
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build beta APK
+        run: ./gradlew assemblePreview
+
+      - name: Sign APK
+        uses: r0adkll/sign-android-release@f30bdd30588842ac76044ecdbd4b6d0e3e813478
+        with:
+          releaseDirectory: app/build/outputs/apk/preview
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: '35.0.1'
+
+      - name: Get version info
+        id: version_info
+        run: |
+          set -e
+          commit_count=$(git rev-list --count HEAD)
+          current_sha=$(git rev-parse --short HEAD)
+          echo "COMMIT_COUNT=$commit_count" >> $GITHUB_OUTPUT
+          echo "CURRENT_SHA=$current_sha" >> $GITHUB_OUTPUT
+
+      - name: Rename APK
+        run: |
+          set -e
+          cd app/build/outputs/apk/preview
+          mv app-arm64-v8a-preview-signed.apk Komikku-beta-arm64-v8a.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Komikku-beta-${{ steps.version_info.outputs.CURRENT_SHA }}
+          path: app/build/outputs/apk/preview/Komikku-beta-arm64-v8a.apk
+          retention-days: 14
