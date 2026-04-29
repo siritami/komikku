@@ -107,15 +107,9 @@ android {
     splits {
         abi {
             isEnable = true
+            isUniversalApk = true
             reset()
-            val abiFilter = project.findProperty("abi") as String?
-            if (abiFilter != null) {
-                isUniversalApk = false
-                include(abiFilter)
-            } else {
-                isUniversalApk = true
-                include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            }
+            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
         }
     }
 

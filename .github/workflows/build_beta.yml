@@ -30,7 +30,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build beta APK
-        run: ./gradlew assemblePreview -Pabi=arm64-v8a
+        run: ./gradlew assemblePreview
 
       - name: Sign APK
         uses: r0adkll/sign-android-release@f30bdd30588842ac76044ecdbd4b6d0e3e813478
@@ -52,15 +52,28 @@ jobs:
           echo "COMMIT_COUNT=$commit_count" >> $GITHUB_OUTPUT
           echo "CURRENT_SHA=$current_sha" >> $GITHUB_OUTPUT
 
-      - name: Rename APK
+      - name: Rename APKs
         run: |
           set -e
           cd app/build/outputs/apk/preview
           mv app-arm64-v8a-preview-signed.apk Komikku-beta-arm64-v8a.apk
+          mv app-armeabi-v7a-preview-signed.apk Komikku-beta-armeabi-v7a.apk
+          mv app-x86-preview-signed.apk Komikku-beta-x86.apk
+          mv app-x86_64-preview-signed.apk Komikku-beta-x86_64.apk
+          mv app-universal-preview-signed.apk Komikku-beta-universal.apk
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: Komikku-beta-${{ steps.version_info.outputs.CURRENT_SHA }}
-          path: app/build/outputs/apk/preview/Komikku-beta-arm64-v8a.apk
-          retention-days: 14
+          tag_name: beta-${{ steps.version_info.outputs.CURRENT_SHA }}
+          name: Komikku Beta - ${{ steps.version_info.outputs.CURRENT_SHA }}
+          body: |
+            Beta build from commit ${{ github.sha }}
+            Commit count: ${{ steps.version_info.outputs.COMMIT_COUNT }}
+          prerelease: true
+          files: |
+            app/build/outputs/apk/preview/Komikku-beta-arm64-v8a.apk
+            app/build/outputs/apk/preview/Komikku-beta-armeabi-v7a.apk
+            app/build/outputs/apk/preview/Komikku-beta-x86.apk
+            app/build/outputs/apk/preview/Komikku-beta-x86_64.apk
+            app/build/outputs/apk/preview/Komikku-beta-universal.apk
